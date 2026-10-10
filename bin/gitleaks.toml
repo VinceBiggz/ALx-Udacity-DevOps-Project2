@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+description = "Exact non-secret CloudFormation private subnet parameter identifiers"
+regexTarget = "secret"
+regexes = ['^PrivateSubnet1CIDR$', '^PrivateSubnet2CIDR$']

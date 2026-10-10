@@ -1,0 +1,88 @@
+#!/bin/bash
+set -uo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd) || { echo "UNAVAILABLE: repository root" >&2; exit 2; }
+cd "$root" || exit 2
+command -v git >/dev/null || { echo "UNAVAILABLE: git required" >&2; exit 2; }
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "UNAVAILABLE: git repository required" >&2; exit 2; }
+for tool in .tools/venv/bin/cfn-lint .tools/venv/bin/python .tools/gitleaks; do
+  [ -x "$tool" ] || { echo "UNAVAILABLE: run bin/setup ($tool)" >&2; exit 2; }
+done
+.tools/venv/bin/cfn-lint --version >/dev/null 2>&1 || { echo "UNAVAILABLE: cfn-lint cannot launch" >&2; exit 2; }
+.tools/venv/bin/python -c 'import cfnlint.decode' >/dev/null 2>&1 || { echo "UNAVAILABLE: Python validator cannot launch" >&2; exit 2; }
+.tools/gitleaks version >/dev/null 2>&1 || { echo "UNAVAILABLE: gitleaks cannot launch" >&2; exit 2; }
+if [ "$(git rev-parse --is-shallow-repository)" != false ]; then echo "UNAVAILABLE: full history required" >&2; exit 2; fi
+outgoing=""
+for revision in "$@"; do
+  case "$revision" in *[!0-9a-f]*|'') echo "FAIL: invalid outgoing object ID" >&2; exit 1;; esac
+  [ "${#revision}" -eq 40 ] || { echo "FAIL: outgoing SHA length" >&2; exit 1; }
+  git cat-file -e "$revision" || { echo "UNAVAILABLE: outgoing object missing" >&2; exit 2; }
+  outgoing="$outgoing $revision"
+done
+failures=0
+run() {
+  "$@"; result=$?
+  case "$result" in
+    0) echo "PASS: $*";;
+    126|127) echo "UNAVAILABLE: command cannot launch" >&2; exit 2;;
+    *) if [ "$result" -ge 128 ]; then echo "UNAVAILABLE: interrupted command" >&2; exit 2; fi
+       echo "FAIL: $*" >&2; failures=$((failures+1));;
+  esac
+}
+for script in bin/setup bin/check .githooks/pre-push; do run /bin/bash -n "$script"; done
+# Bundled CloudFormation schemas only; no AWS API or schema update.
+run .tools/venv/bin/cfn-lint --non-zero-exit-code error --regions us-east-1 --template vinceNet.yml vinceServers.yml
+.tools/venv/bin/python - <<'PYVALIDATE'
+import json,sys
+from cfnlint.decode import decode
+failures=[]
+for template_file,parameter_file in [('vinceNet.yml','vinceParams.json'),('vinceServers.yml','vinceServers.json')]:
+    try:
+        template,errors=decode(template_file)
+    except (OSError,ImportError):
+        print('UNAVAILABLE: template decoder dependency or file',file=sys.stderr);sys.exit(2)
+    if errors or not isinstance(template,dict):
+        failures.append(f'{template_file}: decode failed');continue
+    try:
+        with open(parameter_file) as stream: parameters=json.load(stream)
+    except OSError:
+        print('UNAVAILABLE: parameter file',file=sys.stderr);sys.exit(2)
+    except json.JSONDecodeError:
+        failures.append(f'{parameter_file}: malformed JSON');continue
+    if not isinstance(parameters,list):
+        failures.append(f'{parameter_file}: expected parameter array');continue
+    names=[]
+    for item in parameters:
+        if not isinstance(item,dict) or set(item)!={'ParameterKey','ParameterValue'} or not all(isinstance(v,str) for v in item.values()):
+            failures.append(f'{parameter_file}: invalid parameter object');continue
+        names.append(item['ParameterKey'])
+    if len(names)!=len(set(names)):failures.append(f'{parameter_file}: duplicate keys')
+    declared=template.get('Parameters',{})
+    for name in names:
+        if name not in declared:failures.append(f'{parameter_file}: undeclared parameter {name}')
+    for name,spec in declared.items():
+        if 'Default' not in spec and name not in names:failures.append(f'{parameter_file}: missing required parameter {name}')
+for failure in failures:print('FAIL:',failure,file=sys.stderr)
+sys.exit(bool(failures))
+PYVALIDATE
+validator_status=$?
+case "$validator_status" in 0) echo "PASS: parameter JSON/template references";; 1) failures=$((failures+1));; *) echo "UNAVAILABLE: parameter validator failed to execute" >&2; exit 2;; esac
+# Stream tracked plus unignored changed files; redact all findings and exclude downloaded tools.
+.tools/venv/bin/python - <<'PYSCAN' | .tools/gitleaks stdin --config bin/gitleaks.toml --redact=100 --no-banner --exit-code=1
+import pathlib,subprocess,sys
+result=subprocess.run(['git','ls-files','-z','--cached','--others','--exclude-standard'],check=True,stdout=subprocess.PIPE)
+for name in dict.fromkeys(result.stdout.split(b'\0')):
+    if not name:continue
+    path=pathlib.Path(name.decode())
+    if path.is_symlink() or not path.is_file():continue
+    data=path.read_bytes()
+    if b'\0' in data[:8192]:continue
+    sys.stdout.buffer.write(data+b'\n')
+PYSCAN
+scan_status=("${PIPESTATUS[@]}")
+[ "${scan_status[0]}" -eq 0 ] || { echo "UNAVAILABLE: snapshot producer failed" >&2; exit 2; }
+case "${scan_status[1]}" in 0) echo "PASS: tracked/changed redacted secret scan";; 1) failures=$((failures+1));; *) echo "UNAVAILABLE: snapshot scanner failed to execute" >&2; exit 2;; esac
+.tools/gitleaks git --config bin/gitleaks.toml --gitleaks-ignore-path /dev/null --redact=100 --no-banner --exit-code=1 --log-opts="--all$outgoing" .
+history_status=$?
+case "$history_status" in 0) echo "PASS: full history and outgoing object scan";; 1) failures=$((failures+1));; *) echo "UNAVAILABLE: history scanner failed to execute" >&2; exit 2;; esac
+if [ "$failures" -ne 0 ]; then echo "CHECK RED: $failures failed stages" >&2; exit 1; fi
+echo "CHECK GREEN: offline CloudFormation, parameters, syntax and secret scan"
